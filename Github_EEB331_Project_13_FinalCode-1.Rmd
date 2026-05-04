@@ -1,0 +1,373 @@
+---
+title: "EEB331 Project 13 FINAL Code"
+author: "Leila Granier and Yara Almoussa"
+date: "2026-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(kableExtra)
+library(cowplot)
+```
+
+Aesthetics
+```{r}
+eeb_theme <- function(base_size = 9, base_family = "Arial") {
+  theme_classic(base_size = base_size, base_family = base_family) +
+    theme(
+      # Set all text to Arial
+      text = element_text(family = "Arial"),
+      # Remove grid lines and background
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "transparent", color = NA),
+      plot.background = element_rect(fill = "transparent", color = NA),
+      # Plot title
+      plot.title = element_text(size = base_size, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = base_size, hjust = 0.5, margin = margin(b = 10)),
+      # Axes
+      axis.line = element_line(color = "black"),
+      axis.text = element_text(size = 9, color = "black"),
+      axis.title = element_text(size = 9),
+      # Legend
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.key = element_blank(),
+      legend.text = element_text(size = 9),
+      legend.title = element_text(size = 9),
+    ) 
+}
+```
+
+Fraction of medium-long ROH Calculation (from Precept)
+```{r}
+# Constant
+genome_size <- 2319465413 # in nucleotide base pairs (calculated)
+
+# Read in the ROH output from bcftools
+lines <- readLines("Marmots_maf3_geno90_mind20_ROH.txt")
+lines <- lines[!grepl("^#", lines)]
+rg_lines <- lines[grepl("^RG", lines)]
+
+# Extract ROH segments based on file structure
+roh_segments <- read.table(
+  text = rg_lines,
+  header = FALSE,
+  stringsAsFactors = FALSE)
+
+# Add back in column names based on read group (RG) headers
+colnames(roh_segments) <- c(
+  "type",
+  "sample",
+  "chr",
+  "start",
+  "end",
+  "length_bp",
+  "n_markers",
+  "quality")
+
+# Calculate some basic metrics
+long_roh_summary <- roh_segments %>%
+  mutate(length_bp = as.numeric(end) - as.numeric(start)) %>%
+  # Filtering for ROHs longer than 1 Mb = 1,000,000 bp (medium to long ROHs)
+  filter(length_bp > 1000000) %>% 
+  group_by(sample) %>%
+  summarise(
+    NSEG = n(),
+    total_bp = sum(length_bp),
+    mean_bp = mean(length_bp),
+    mean_length = total_bp / NSEG)
+
+# Calculate FROH per individual
+# FROH = the fraction of an individual's genome that is identical by descent (IBD)
+long_roh_summary <- long_roh_summary %>%
+  filter(str_starts(sample, "UID")) %>% 
+  mutate(FROH = total_bp / genome_size) %>%  
+  mutate(uid = sub("UID_(\\d+_\\d+)_sorted.*", "\\1", sample))
+head(long_roh_summary)
+```
+
+Combining marmot mass data, metadata, and FROH data
+```{r}
+# Import data files
+marm_mass <- read.csv("marmot_mass_metadata.csv")
+metadata <- read.csv("RADseq_pedigree_metadata.csv")
+
+# Merge data sets to make final data frame
+mass_FlongROH <- merge(metadata, merge(long_roh_summary, marm_mass, by = "uid"), by = "uid") %>% 
+  mutate(uid = as.factor(uid),
+         sex = as.factor(sex),
+         age = as.factor(age),
+         yrborn = as.factor(yrborn)) %>% 
+  select(uid, sex, yrborn, age, FROH, massaug, massjun,  nb_mass, total_bp, 
+         mean_bp, mean_length, NSEG, col_area) %>% 
+  mutate(massgain = massaug-massjun,
+         mean_length_kb = mean_length/1000)
+mass_FlongROH
+```
+
+AIC analysis to identify best model
+```{r}
+# Linear model of mass gain with just FROH as fixed effect
+base_mod <- lm(massgain ~ FROH, data = mass_FlongROH)
+
+# Linear model of mass gain with FROH and sex as fixed effects
+mod_sex <- lm(massgain ~ FROH + sex, data = mass_FlongROH)
+
+# Linear mixed effects model of mass gain with FROH as fixed effect and year born as random effect
+mod_yrborn <- lmer(massgain ~ FROH + (1|yrborn), 
+                    data = mass_FlongROH, REML = FALSE)
+
+# Linear mixed effects model of mass gain with FROH and sex as fixed effects and year born as random effect
+mod_sexyrborn <- lmer(massgain ~ FROH + sex + (1|yrborn), 
+                       data = mass_FlongROH, REML = FALSE)
+
+
+# Conduct AIC analyses
+ms_df <- as.data.frame(model.sel(base_mod, mod_sex, mod_yrborn, mod_sexyrborn))
+
+# Keep only useful columns
+ms_df <- ms_df[, c("df", "logLik", "AICc", "delta", "weight")]
+
+ms_df$AICc <- round(ms_df$AICc, 1)
+ms_df$delta <- round(ms_df$delta, 3)
+
+# Rename columns and models
+colnames(ms_df) <- c("K", "logLik", "AICc", "Delta AICc", "Weight")
+
+ms_df$Model <- c("Base model + year born (random)",
+  "Base model + sex (fixed) + year born (random)",
+  "Base model: Mass gain ~ FROH",
+  "Base model + sex (fixed)")
+
+# Order by best AICc value
+ms_df <- ms_df[order(ms_df$AICc), ]
+
+# Table formatting
+kable(ms_df[, c("Model", "K", "AICc", "Delta AICc")]) %>% 
+  kable_styling(position = "left", full_width = FALSE)
+```
+
+```{r}
+# Best model summary
+summary(mod_yrborn)
+```
+
+Plotting Frequency of ROH >1Mb vs mass gain including best linear mixed effect model
+```{r}
+# Setting up data to incorporate predictions from best model in plot
+pred_data <- data.frame(
+  FROH = seq(min(mass_FlongROH$FROH),
+             max(mass_FlongROH$FROH),
+             length.out = 100))
+pred_data$pred <- predict(mod_yrborn, newdata = pred_data, re.form = NA)
+
+X <- model.matrix(~ FROH, pred_data)
+beta <- fixef(mod_yrborn)
+vcov_mat <- vcov(mod_yrborn)
+
+pred_data$fit <- X %*% beta
+pred_data$se  <- sqrt(diag(X %*% vcov_mat %*% t(X)))
+
+#95% confidence interval to account for year born random effect in error bars 
+pred_data$upper <- pred_data$fit + 1.96 * pred_data$se
+pred_data$lower <- pred_data$fit - 1.96 * pred_data$se
+
+# Making scatterplot with linear mixed effects model regression overlayed with error bars
+massFROH_plot <- ggplot(mass_FlongROH, aes(x = FROH, y = massgain)) +
+  geom_point() +
+  geom_line(data = pred_data, aes(x = FROH, y = pred), size = 1.2) +
+  geom_ribbon(data = pred_data,
+              aes(y = fit, ymin = lower, ymax = upper),
+              alpha = 0.2) +
+  labs(x = "FROH",
+       y = "Mass gain over warm season (g)") +
+  eeb_theme()
+massFROH_plot
+```
+```{r}
+# ggsave("massFROH_plot.png", plot = massFROH_plot, width = 7, height = 4, units = "in", dpi=500, bg="transparent")
+```
+
+AVERAGE ROH LENGTH vs mass gain
+AIC analysis to identify best model
+```{r}
+# Linear model of mass gain with just FROH as fixed effect
+base_mod_length <- lm(massgain ~ mean_length_kb, data = mass_FlongROH)
+
+# Linear model of mass gain with FROH and sex as fixed effects
+mod_sex_length <- lm(massgain ~ mean_length_kb + sex, data = mass_FlongROH)
+
+# Linear mixed effects model of mass gain with FROH as fixed effect and year born as random effect
+mod_yrborn_length <- lmer(massgain ~ mean_length_kb + (1|yrborn), 
+                    data = mass_FlongROH, REML = FALSE)
+
+# Linear mixed effects model of mass gain with FROH and sex as fixed effects and year born as random effect
+mod_sexyrborn_length <- lmer(massgain ~ mean_length_kb + sex + (1|yrborn), 
+                       data = mass_FlongROH, REML = FALSE)
+
+
+# Conduct AIC analyses
+ms_df_length <- as.data.frame(model.sel(base_mod_length, mod_sex_length, 
+                                        mod_yrborn_length, mod_sexyrborn_length))
+
+# Keep only useful columns
+ms_df_length <- ms_df_length[, c("df", "logLik", "AICc", "delta", "weight")]
+
+ms_df_length$AICc <- round(ms_df_length$AICc, 1)
+ms_df_length$delta <- round(ms_df_length$delta, 3)
+
+# Rename columns and models
+colnames(ms_df_length) <- c("K", "logLik", "AICc", "Delta AICc", "Weight")
+
+ms_df_length$Model <- c("Base model + year born (random)",
+  "Base model + sex (fixed) + year born (random)",
+  "Base model: Mass gain ~ FROH",
+  "Base model + sex (fixed)")
+
+# Order by best AICc value
+ms_df_length <- ms_df_length[order(ms_df_length$AICc), ]
+
+# Table formatting
+kable(ms_df_length[, c("Model", "K", "AICc", "Delta AICc")]) %>% 
+  kable_styling(position = "left", full_width = FALSE)
+```
+
+```{r}
+# Best model summary
+summary(mod_yrborn_length)
+```
+
+Plotting mean ROH length vs mass gain including best linear mixed effect model
+```{r}
+# Setting up data to incorporate predictions from best model in plot
+pred_data_length <- data.frame(
+  mean_length_kb = seq(min(mass_FlongROH$mean_length_kb),
+             max(mass_FlongROH$mean_length_kb),
+             length.out = 100))
+pred_data_length$pred <- predict(mod_yrborn_length, newdata = pred_data_length, re.form = NA)
+
+X <- model.matrix(~ mean_length_kb, pred_data_length)
+beta <- fixef(mod_yrborn_length)
+vcov_mat <- vcov(mod_yrborn_length)
+
+pred_data_length$fit <- X %*% beta
+pred_data_length$se  <- sqrt(diag(X %*% vcov_mat %*% t(X)))
+
+#95% confidence interval to account for year born random effect in error bars 
+pred_data_length$upper <- pred_data_length$fit + 1.96 * pred_data_length$se
+pred_data_length$lower <- pred_data_length$fit - 1.96 * pred_data_length$se
+
+# Making scatterplot with linear mixed effects model regression overlayed with error bars
+mass_length_plot <- ggplot(mass_FlongROH, aes(x = mean_length_kb, y = massgain)) +
+  geom_point() +
+  geom_line(data = pred_data_length, aes(x = mean_length_kb, y = pred), size = 1.2) +
+  geom_ribbon(data = pred_data_length,
+              aes(y = fit, ymin = lower, ymax = upper),
+              alpha = 0.2) +
+  labs(x = "Mean ROH length (kb)",
+       y = "Mass gain over warm season (g)") +
+  eeb_theme() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), 
+            axis.ticks.y = element_blank())
+mass_length_plot
+```
+
+Number of ROH segments vs mass gain
+AIC analysis to identify best model
+```{r}
+# Linear model of mass gain with just FROH as fixed effect
+base_mod_num <- lm(massgain ~ NSEG, data = mass_FlongROH)
+
+# Linear model of mass gain with FROH and sex as fixed effects
+mod_sex_num <- lm(massgain ~ NSEG + sex, data = mass_FlongROH)
+
+# Linear mixed effects model of mass gain with FROH as fixed effect and year born as random effect
+mod_yrborn_num <- lmer(massgain ~ NSEG + (1|yrborn), 
+                    data = mass_FlongROH, REML = FALSE)
+
+# Linear mixed effects model of mass gain with FROH and sex as fixed effects and year born as random effect
+mod_sexyrborn_num <- lmer(massgain ~ NSEG + sex + (1|yrborn), 
+                       data = mass_FlongROH, REML = FALSE)
+
+
+# Conduct AIC analyses
+ms_df_num <- as.data.frame(model.sel(base_mod_num, mod_sex_num, 
+                                        mod_yrborn_num, mod_sexyrborn_num))
+
+# Keep only useful columns
+ms_df_num <- ms_df_num[, c("df", "logLik", "AICc", "delta", "weight")]
+
+ms_df_num$AICc <- round(ms_df_num$AICc, 1)
+ms_df_num$delta <- round(ms_df_num$delta, 3)
+
+# Rename columns and models
+colnames(ms_df_num) <- c("K", "logLik", "AICc", "Delta AICc", "Weight")
+
+ms_df_num$Model <- c("Base model + year born (random)",
+  "Base model + sex (fixed) + year born (random)",
+  "Base model + sex (fixed)",
+  "Base model: Mass gain ~ FROH")
+
+# Order by best AICc value
+ms_df_num <- ms_df_num[order(ms_df_num$AICc), ]
+
+# Table formatting
+kable(ms_df_num[, c("Model", "K", "AICc", "Delta AICc")]) %>% 
+  kable_styling(position = "left", full_width = FALSE)
+```
+
+```{r}
+# Best model summary
+summary(mod_yrborn_num)
+```
+
+Plotting number of ROH segments vs mass gain including best linear mixed effect model
+```{r}
+# Setting up data to incorporate predictions from best model in plot
+pred_data_num <- data.frame(
+  NSEG = seq(min(mass_FlongROH$NSEG),
+             max(mass_FlongROH$NSEG),
+             length.out = 100))
+pred_data_num$pred <- predict(mod_yrborn_num, newdata = pred_data_num, re.form = NA)
+
+X <- model.matrix(~ NSEG, pred_data_num)
+beta <- fixef(mod_yrborn_num)
+vcov_mat <- vcov(mod_ybornr_num)
+
+pred_data_num$fit <- X %*% beta
+pred_data_num$se  <- sqrt(diag(X %*% vcov_mat %*% t(X)))
+
+#95% confidence interval to account for year born random effect in error bars 
+pred_data_num$upper <- pred_data_num$fit + 1.96 * pred_data_num$se
+pred_data_num$lower <- pred_data_num$fit - 1.96 * pred_data_num$se
+
+# Making scatterplot with linear mixed effects model regression overlayed with error bars
+mass_num_plot <- ggplot(mass_FlongROH, aes(x = NSEG, y = massgain)) +
+  geom_point() +
+  geom_line(data = pred_data_num, aes(x = NSEG, y = pred), size = 1.2) +
+  geom_ribbon(data = pred_data_num,
+              aes(y = fit, ymin = lower, ymax = upper),
+              alpha = 0.2) +
+  labs(x = "Number of ROH segments",
+       y = "Mass gain over warm season (g)") +
+  eeb_theme() +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), 
+            axis.ticks.y = element_blank())
+  
+mass_num_plot
+```
+
+```{r}
+allplots <- plot_grid(massFROH_plot, mass_length_plot, mass_num_plot, ncol=3,
+                      align = "h", axis = "l")
+allplots
+```
+
+
