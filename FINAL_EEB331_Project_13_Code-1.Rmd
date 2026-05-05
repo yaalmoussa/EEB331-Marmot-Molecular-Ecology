@@ -1,6 +1,6 @@
 ---
 title: "EEB331 Project 13 FINAL Code"
-author: "Leila Granier"
+author: "Leila Granier and Yara Almoussa"
 date: "2026-04-15"
 output: html_document
 ---
